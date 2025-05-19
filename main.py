@@ -8,11 +8,8 @@ import statistics
 
 app = FastAPI()
 
-# ------------------------------
-# Database Setup
-# ------------------------------
 def get_db():
-    conn = sqlite3.connect("trades.db")
+    conn = sqlite3.connect("ai_trading.db")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -26,13 +23,23 @@ def init_db():
             asset_type TEXT,
             strategy TEXT,
             entry_price REAL,
-            exit_price REAL,
             stop_loss REAL,
             take_profit REAL,
-            result TEXT,
             confidence REAL,
+            result TEXT,
             pnl REAL,
-            notes TEXT
+            notes TEXT,
+            indicators TEXT
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS strategy_parameters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_name TEXT,
+            stop_loss_pct REAL,
+            confidence_threshold REAL,
+            macro_weight REAL,
+            updated_at TEXT
         )
     ''')
     db.commit()
@@ -40,9 +47,6 @@ def init_db():
 
 init_db()
 
-# ------------------------------
-# Models
-# ------------------------------
 class TradeRequest(BaseModel):
     asset: str
     asset_type: str
@@ -51,8 +55,8 @@ class TradeRequest(BaseModel):
     indicators: Optional[dict] = {}
     account_balance: float
     risk_tolerance: Optional[float] = 0.02
-    volatility_index: Optional[float] = 1.0  # default neutral
-    correlation: Optional[float] = 0.0  # with broader market
+    volatility_index: Optional[float] = 1.0
+    correlation: Optional[float] = 0.0
 
 class TradeLog(BaseModel):
     asset: str
@@ -65,77 +69,98 @@ class TradeLog(BaseModel):
     result: Optional[str]
     confidence: float
     pnl: Optional[float]
+    indicators: Optional[dict]
     notes: Optional[str] = None
 
-# ------------------------------
-# Strategy Logic
-# ------------------------------
 @app.post("/strategy/stocks")
 def stock_strategy(req: TradeRequest):
     price = req.price_data[-1]
-    signal = "BUY" if req.indicators.get("vwma_trend") == "up" else "HOLD"
-    confidence = 0.78
-    if req.indicators.get("volume_profile_zone") == "LVN":
-        confidence += 0.05
-
-    # Adjust risk based on volatility
-    adjusted_risk = req.risk_tolerance / req.volatility_index
     stop_loss_pct = 0.03
-    position_size = req.account_balance * adjusted_risk / stop_loss_pct
+    stop_loss = round(price * (1 - stop_loss_pct), 2)
+    take_profit = round(price * 1.05, 2)
+    confidence = 0.78
+    position_size = round(req.account_balance * req.risk_tolerance / stop_loss_pct, 2)
 
-    response = {
+    return {
         "asset": req.asset,
-        "action": signal,
+        "action": "BUY",
         "entry_price": price,
-        "stop_loss": round(price * (1 - stop_loss_pct), 2),
-        "take_profit": round(price * 1.05, 2),
-        "confidence": round(confidence, 2),
-        "strategy": "VWMA + Volume Profile + SMC + Market Regime",
-        "position_size": round(position_size, 2)
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "confidence": confidence,
+        "strategy": "VWMA + Volume Profile + SMC",
+        "position_size": position_size
     }
-    return response
 
 @app.post("/strategy/commodities")
 def commodity_strategy(req: TradeRequest):
+    db = get_db()
+    params = db.execute("SELECT * FROM strategy_parameters WHERE strategy_name = ?", ("commodity_default",)).fetchone()
+    stop_loss_pct = params["stop_loss_pct"]
+    confidence_threshold = params["confidence_threshold"]
+
     price = req.price_data[-1]
-    signal = "BUY" if req.indicators.get("orderflow") == "bullish" else "WAIT"
-    confidence = 0.73
-    if req.indicators.get("macro_bias") == "positive":
-        confidence += 0.05
+    stop_loss = round(price * (1 - stop_loss_pct), 2)
+    take_profit = round(price * 1.05, 2)
+    confidence = round(confidence_threshold + 0.03, 2)
+    position_size = round(req.account_balance * req.risk_tolerance / stop_loss_pct, 2)
 
-    # Adjust risk for volatility and correlation
-    adjusted_risk = req.risk_tolerance / (req.volatility_index * (1 + abs(req.correlation)))
-    stop_loss_pct = 0.025
-    position_size = req.account_balance * adjusted_risk / stop_loss_pct
+    db.execute('''
+        INSERT INTO trades (
+            timestamp, asset, asset_type, strategy,
+            entry_price, stop_loss, take_profit, confidence,
+            result, pnl, notes, indicators
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        datetime.utcnow().isoformat(),
+        req.asset,
+        req.asset_type,
+        "MACD + Order Flow + Volatility Adjusted",
+        price,
+        stop_loss,
+        take_profit,
+        confidence,
+        None,
+        None,
+        "Auto-logged",
+        str(req.indicators)
+    ))
+    db.commit()
+    db.close()
 
-    response = {
+    return {
         "asset": req.asset,
-        "action": signal,
+        "action": "BUY" if confidence > confidence_threshold else "WAIT",
         "entry_price": price,
-        "stop_loss": round(price * (1 - stop_loss_pct), 2),
-        "take_profit": round(price * 1.05, 2),
-        "confidence": round(confidence, 2),
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "confidence": confidence,
         "strategy": "MACD + Order Flow + Volatility Adjusted",
-        "position_size": round(position_size, 2)
+        "position_size": position_size
     }
-    return response
 
-# ------------------------------
-# Logging & Learning
-# ------------------------------
 @app.post("/log")
 def log_trade(trade: TradeLog):
     db = get_db()
     db.execute('''
         INSERT INTO trades (
-            timestamp, asset, asset_type, strategy, entry_price,
-            exit_price, stop_loss, take_profit, result, confidence,
-            pnl, notes
+            timestamp, asset, asset_type, strategy,
+            entry_price, stop_loss, take_profit,
+            confidence, result, pnl, notes, indicators
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        datetime.utcnow().isoformat(), trade.asset, trade.asset_type,
-        trade.strategy, trade.entry_price, trade.exit_price, trade.stop_loss,
-        trade.take_profit, trade.result, trade.confidence, trade.pnl, trade.notes
+        datetime.utcnow().isoformat(),
+        trade.asset,
+        trade.asset_type,
+        trade.strategy,
+        trade.entry_price,
+        trade.stop_loss,
+        trade.take_profit,
+        trade.confidence,
+        trade.result,
+        trade.pnl,
+        trade.notes,
+        str(trade.indicators)
     ))
     db.commit()
     db.close()
@@ -144,8 +169,7 @@ def log_trade(trade: TradeLog):
 @app.get("/learn")
 def learn_from_trades():
     db = get_db()
-    cur = db.execute("SELECT * FROM trades ORDER BY timestamp ASC")
-    rows = cur.fetchall()
+    rows = db.execute("SELECT * FROM trades ORDER BY timestamp ASC").fetchall()
     db.close()
 
     if not rows:
@@ -153,50 +177,64 @@ def learn_from_trades():
 
     stats = {}
     equity_curve = []
-    balance = 10000  # starting balance
+    balance = 10000
     max_balance = balance
     max_drawdown = 0
+    degradation_window = 5
 
     for row in rows:
         strat = row["strategy"]
         pnl = row["pnl"] or 0.0
+        confidence = row["confidence"] or 0.0
         result = row["result"]
+
         if strat not in stats:
-            stats[strat] = {"wins": 0, "losses": 0, "total": 0, "total_pnl": 0.0, "pnl_list": []}
+            stats[strat] = {
+                "wins": 0, "losses": 0, "total": 0, "pnl_list": [],
+                "confidences": [], "accuracy_high_conf": 0, "high_conf_total": 0
+            }
+
         if result == "win":
             stats[strat]["wins"] += 1
         elif result == "loss":
             stats[strat]["losses"] += 1
-        stats[strat]["total"] += 1
-        stats[strat]["total_pnl"] += pnl
-        stats[strat]["pnl_list"].append(pnl)
 
-        # equity tracking
+        stats[strat]["total"] += 1
+        stats[strat]["pnl_list"].append(pnl)
+        stats[strat]["confidences"].append(confidence)
+
+        if confidence >= 0.8:
+            stats[strat]["high_conf_total"] += 1
+            if result == "win":
+                stats[strat]["accuracy_high_conf"] += 1
+
         balance += pnl
         equity_curve.append(balance)
-        max_balance = max(max_balance, balance)
+        if balance > max_balance:
+            max_balance = balance
         drawdown = (max_balance - balance) / max_balance
         max_drawdown = max(max_drawdown, drawdown)
 
     for s in stats:
-        wins = stats[s]["wins"]
         total = stats[s]["total"]
-        pnl_list = stats[s]["pnl_list"]
-        avg_pnl = statistics.mean(pnl_list) if pnl_list else 0
-        rr_ratio = avg_pnl / 0.02 if 0.02 else 0
-        stats[s].update({
-            "win_rate": round(wins / total, 2),
-            "avg_pnl": round(avg_pnl, 2),
-            "rr_ratio": round(rr_ratio, 2)
-        })
+        stats[s]["win_rate"] = round(stats[s]["wins"] / total, 2) if total else 0
+        stats[s]["avg_pnl"] = round(statistics.mean(stats[s]["pnl_list"]), 2) if stats[s]["pnl_list"] else 0
+        stats[s]["avg_confidence"] = round(statistics.mean(stats[s]["confidences"]), 2) if stats[s]["confidences"] else 0
+        if stats[s]["high_conf_total"] > 0:
+            stats[s]["confidence_accuracy"] = round(stats[s]["accuracy_high_conf"] / stats[s]["high_conf_total"], 2)
+
+        if len(stats[s]["pnl_list"]) >= degradation_window * 2:
+            early = stats[s]["pnl_list"][:degradation_window]
+            late = stats[s]["pnl_list"][-degradation_window:]
+            stats[s]["strategy_degradation"] = round(statistics.mean(late) - statistics.mean(early), 2)
 
     return {
         "strategy_stats": stats,
+        "final_balance": round(balance, 2),
         "max_drawdown_pct": round(max_drawdown * 100, 2),
-        "total_trades": len(rows),
-        "final_balance": round(balance, 2)
+        "total_trades": len(rows)
     }
 
 @app.get("/")
 def root():
-    return {"message": "Jo Investing AI API v4 — full market-aware, learning-based system running."}
+    return {"message": "AI strategy backend v5 with full analytics is running."}
