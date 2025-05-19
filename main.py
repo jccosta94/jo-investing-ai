@@ -74,6 +74,9 @@ class TradeRequest(BaseModel):
     risk_tolerance: Optional[float] = 0.02
     volatility_index: Optional[float] = 1.0
     correlation: Optional[float] = 0.0
+    # New fields for news data
+    news_sentiment: Optional[float] = None
+    news_events: Optional[List[Dict]] = None
 
 class UpdateStrategySettings(BaseModel):
     strategy_name: str
@@ -94,6 +97,9 @@ class LogRequest(BaseModel):
     pnl: Optional[float] = None
     notes: Optional[str] = None
     indicators: Optional[Dict] = {}
+    # Add news fields to logging
+    news_sentiment: Optional[float] = None
+    news_events: Optional[List[Dict]] = None
 
 # Helper: fetch all trades
 
@@ -125,35 +131,89 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
     price = req.price_data[-1]
     stop_loss_pct = params["stop_loss_pct"]
     confidence_threshold = params["confidence_threshold"]
+    macro_weight = params["macro_weight"]
+    
     # Basic TP at +5%
     stop_loss = round(price * (1 - stop_loss_pct), 2)
     take_profit = round(price * 1.05, 2)
     confidence = round(confidence_threshold + 0.03, 2)
+    
+    # Process news sentiment if available
+    news_impact = 0
+    if req.news_sentiment is not None:
+        # Apply sentiment impact scaled by macro_weight
+        news_impact = req.news_sentiment * macro_weight
+        confidence += news_impact
+    
+    # Check for significant news events
+    significant_event = False
+    event_note = ""
+    if req.news_events:
+        for event in req.news_events:
+            # Look for high importance events
+            if event.get('importance', 0) > 0.7:
+                significant_event = True
+                event_note = f"Significant event: {event.get('title', 'Unnamed event')}"
+                
+                # Adjust take profit for positive events
+                if event.get('sentiment', 0) > 0:
+                    take_profit = round(price * 1.07, 2)  # Higher target on positive news
+                break
+    
+    # Calculate position size
     position_size = round(req.account_balance * req.risk_tolerance / stop_loss_pct, 2)
-
-    # Log trade
+    
+    # Determine action with news override for very negative news
+    action = "BUY" if confidence > confidence_threshold else "WAIT"
+    if req.news_sentiment is not None and req.news_sentiment < -0.7:
+        action = "WAIT"  # Override on very negative news
+        event_note += " | Trading paused due to negative news"
+    
+    # Log trade with news info
+    notes = "Auto-logged"
+    if event_note:
+        notes += f" | {event_note}"
+    
+    news_info = {
+        "sentiment": req.news_sentiment,
+        "events": req.news_events[:2] if req.news_events else []  # Limit to first 2 events
+    }
+    
+    # Log the trade
     db.execute(
         '''INSERT INTO trades (
             timestamp, asset, asset_type, strategy,
             entry_price, stop_loss, take_profit, confidence,
             result, pnl, notes, indicators
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
-        datetime.utcnow().isoformat(), req.asset, req.asset_type, strategy_name,
-        price, stop_loss, take_profit, confidence,
-        None, None, "Auto-logged", str(req.indicators)
+        datetime.utcnow().isoformat(), 
+        req.asset, 
+        req.asset_type, 
+        strategy_name,
+        price, 
+        stop_loss, 
+        take_profit, 
+        confidence,
+        None, 
+        None, 
+        notes,
+        str({**req.indicators, "news": news_info})  # Include news in indicators
     ))
     db.commit()
     db.close()
 
+    # Return response with news impact info
     return {
         "asset": req.asset,
-        "action": "BUY" if confidence > confidence_threshold else "WAIT",
+        "action": action,
         "entry_price": price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "confidence": confidence,
         "strategy": strategy_name,
-        "position_size": position_size
+        "position_size": position_size,
+        "news_impact": news_impact,
+        "significant_event": significant_event
     }
 
 # Manual logging endpoint
@@ -161,6 +221,16 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
 def manual_log(log: LogRequest):
     db = get_db()
     ts = log.timestamp or datetime.utcnow().isoformat()
+    
+    # Prepare indicators with news data if available
+    indicators_data = log.indicators or {}
+    if log.news_sentiment is not None or log.news_events:
+        news_info = {
+            "sentiment": log.news_sentiment,
+            "events": log.news_events[:2] if log.news_events else []
+        }
+        indicators_data["news"] = news_info
+    
     db.execute(
         '''INSERT INTO trades (
             timestamp, asset, asset_type, strategy,
@@ -169,7 +239,7 @@ def manual_log(log: LogRequest):
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
         ts, log.asset, log.asset_type, log.strategy,
         log.entry_price, log.stop_loss, log.take_profit, log.confidence,
-        log.result, log.pnl, log.notes or "", str(log.indicators or {})
+        log.result, log.pnl, log.notes or "", str(indicators_data)
     ))
     db.commit()
     db.close()
@@ -184,13 +254,28 @@ def learn():
     losses = sum(1 for r in rows if r["pnl"] and r["pnl"] <= 0)
     win_rate = wins / total if total else None
     avg_pnl = sum(r["pnl"] for r in rows if r["pnl"] is not None) / total if total else None
-    # Max drawdown: naive by lowest PnL
+    
+    # Add news analysis section
+    news_influenced_trades = []
+    for r in rows:
+        indicators_str = r["indicators"]
+        if '"news":' in indicators_str:
+            news_influenced_trades.append(r)
+    
+    news_trades_count = len(news_influenced_trades)
+    news_wins = sum(1 for r in news_influenced_trades if r["pnl"] and r["pnl"] > 0)
+    news_win_rate = news_wins / news_trades_count if news_trades_count else None
+    
+    # Max drawdown calculation
     drawdowns = [r["pnl"] for r in rows if r["pnl"] is not None]
     max_dd = min(drawdowns) if drawdowns else None
+    
     # Confidence accuracy
-    correct_conf = sum(1 for r in rows if r["confidence"] and r["pnl"] is not None and ((r["confidence"]>=0.5 and r["pnl"]>0) or (r["confidence"]<0.5 and r["pnl"]<=0)))
+    correct_conf = sum(1 for r in rows if r["confidence"] and r["pnl"] is not None and 
+                    ((r["confidence"]>=0.5 and r["pnl"]>0) or (r["confidence"]<0.5 and r["pnl"]<=0)))
     accuracy = correct_conf / total if total else None
 
+    # Return with news analysis
     return {
         "total_trades": total,
         "wins": wins,
@@ -198,7 +283,12 @@ def learn():
         "win_rate": win_rate,
         "avg_pnl": avg_pnl,
         "max_drawdown": max_dd,
-        "confidence_accuracy": accuracy
+        "confidence_accuracy": accuracy,
+        "news_analysis": {
+            "news_influenced_trades": news_trades_count,
+            "news_win_rate": news_win_rate,
+            "difference_from_overall": (news_win_rate - win_rate) if news_win_rate and win_rate else None
+        }
     }
 
 # Update strategy parameters
@@ -238,4 +328,4 @@ def update_strategy_settings(settings: UpdateStrategySettings):
 # Health check
 @app.get("/")
 def root():
-    return {"message": "AI strategy backend v6 with full endpoints is running."}
+    return {"message": "AI strategy backend v7 with news integration is running."}
