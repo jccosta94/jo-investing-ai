@@ -31,7 +31,8 @@ def init_db():
             result TEXT,
             pnl REAL,
             notes TEXT,
-            indicators TEXT
+            indicators TEXT,
+            position_type TEXT
         )
     ''')
     # Strategy parameters
@@ -77,6 +78,8 @@ class TradeRequest(BaseModel):
     # New fields for news data
     news_sentiment: Optional[float] = None
     news_events: Optional[List[Dict]] = None
+    # Trend direction indicators
+    trend_direction: Optional[float] = None  # Positive for uptrend, negative for downtrend
 
 class UpdateStrategySettings(BaseModel):
     strategy_name: str
@@ -100,6 +103,7 @@ class LogRequest(BaseModel):
     # Add news fields to logging
     news_sentiment: Optional[float] = None
     news_events: Optional[List[Dict]] = None
+    position_type: Optional[str] = "LONG"  # Default to LONG for backward compatibility
 
 # Helper: fetch all trades
 
@@ -133,16 +137,42 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
     confidence_threshold = params["confidence_threshold"]
     macro_weight = params["macro_weight"]
     
-    # Basic TP at +5%
-    stop_loss = round(price * (1 - stop_loss_pct), 2)
-    take_profit = round(price * 1.05, 2)
-    confidence = round(confidence_threshold + 0.03, 2)
+    # Initialize direction and base confidence
+    # We'll use this to determine LONG vs SHORT positions
+    direction = 1  # Default to uptrend (LONG)
+    base_confidence = 0.5  # Neutral starting point
+    
+    # Determine direction from trend indicator if provided
+    if req.trend_direction is not None:
+        if req.trend_direction > 0:
+            direction = 1  # Uptrend - LONG position
+            base_confidence = 0.5 + abs(req.trend_direction) * 0.2  # Boost confidence based on trend strength
+        elif req.trend_direction < 0:
+            direction = -1  # Downtrend - SHORT position
+            base_confidence = 0.5 + abs(req.trend_direction) * 0.2  # Boost confidence based on trend strength
+    
+    # Add strategy-specific confidence modifier
+    confidence = round(base_confidence + confidence_threshold * 0.1, 2)
+    
+    # Calculate stop loss and take profit based on position direction
+    if direction > 0:  # LONG position
+        stop_loss = round(price * (1 - stop_loss_pct), 2)
+        take_profit = round(price * (1 + stop_loss_pct * 1.5), 2)  # TP at 1.5x SL distance
+        position_type = "LONG"
+    else:  # SHORT position
+        stop_loss = round(price * (1 + stop_loss_pct), 2)
+        take_profit = round(price * (1 - stop_loss_pct * 1.5), 2)  # TP at 1.5x SL distance
+        position_type = "SHORT"
     
     # Process news sentiment if available
     news_impact = 0
     if req.news_sentiment is not None:
         # Apply sentiment impact scaled by macro_weight
         news_impact = req.news_sentiment * macro_weight
+        # For short positions, negative news is positive for the trade
+        # and positive news is negative
+        if direction < 0:
+            news_impact = -news_impact
         confidence += news_impact
     
     # Check for significant news events
@@ -155,19 +185,36 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
                 significant_event = True
                 event_note = f"Significant event: {event.get('title', 'Unnamed event')}"
                 
-                # Adjust take profit for positive events
-                if event.get('sentiment', 0) > 0:
-                    take_profit = round(price * 1.07, 2)  # Higher target on positive news
+                # Adjust take profit for positive events based on position type
+                event_sentiment = event.get('sentiment', 0)
+                if (direction > 0 and event_sentiment > 0) or (direction < 0 and event_sentiment < 0):
+                    # Extend take profit for favorable news
+                    if direction > 0:  # LONG
+                        take_profit = round(price * (1 + stop_loss_pct * 2), 2)
+                    else:  # SHORT
+                        take_profit = round(price * (1 - stop_loss_pct * 2), 2)
                 break
     
     # Calculate position size
     position_size = round(req.account_balance * req.risk_tolerance / stop_loss_pct, 2)
     
-    # Determine action with news override for very negative news
-    action = "BUY" if confidence > confidence_threshold else "WAIT"
-    if req.news_sentiment is not None and req.news_sentiment < -0.7:
-        action = "WAIT"  # Override on very negative news
-        event_note += " | Trading paused due to negative news"
+    # Determine action with confidence threshold and news override
+    # Low confidence -> NO_TRADE
+    # Medium confidence but below threshold -> WAIT
+    # Above threshold -> BUY/SELL based on direction
+    
+    if confidence < 0.4:
+        action = "NO_TRADE"  # Too uncertain, don't trade at all
+    elif confidence < confidence_threshold:
+        action = "WAIT"  # Some signal but not strong enough yet
+    else:
+        action = "BUY" if direction > 0 else "SELL"  # Strong signal, trade according to direction
+    
+    # Override for very negative news affecting our position direction
+    if req.news_sentiment is not None:
+        if (direction > 0 and req.news_sentiment < -0.7) or (direction < 0 and req.news_sentiment > 0.7):
+            action = "NO_TRADE"  # Override on very contradictory news
+            event_note += " | Trading paused due to contradictory news"
     
     # Log trade with news info
     notes = "Auto-logged"
@@ -184,8 +231,8 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
         '''INSERT INTO trades (
             timestamp, asset, asset_type, strategy,
             entry_price, stop_loss, take_profit, confidence,
-            result, pnl, notes, indicators
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+            result, pnl, notes, indicators, position_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
         datetime.utcnow().isoformat(), 
         req.asset, 
         req.asset_type, 
@@ -197,12 +244,13 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
         None, 
         None, 
         notes,
-        str({**req.indicators, "news": news_info})  # Include news in indicators
+        str({**req.indicators, "news": news_info}),  # Include news in indicators
+        position_type
     ))
     db.commit()
     db.close()
 
-    # Return response with news impact info
+    # Return response with news impact info and direction
     return {
         "asset": req.asset,
         "action": action,
@@ -213,8 +261,25 @@ def _apply_strategy(req: TradeRequest, strategy_name: str):
         "strategy": strategy_name,
         "position_size": position_size,
         "news_impact": news_impact,
-        "significant_event": significant_event
+        "significant_event": significant_event,
+        "position_type": position_type,
+        "confidence_interpretation": _interpret_confidence(action, confidence)
     }
+
+def _interpret_confidence(action, confidence):
+    """Provide interpretation of the confidence level and action"""
+    if action == "NO_TRADE":
+        return "Confidence too low to establish a position. Recommend avoiding this trade."
+    elif action == "WAIT":
+        return "Monitoring situation. Signal not yet strong enough for action."
+    elif confidence > 0.9:
+        return "Very high confidence in this trade direction."
+    elif confidence > 0.8:
+        return "Strong confidence in this trade direction."
+    elif confidence > confidence_threshold:
+        return "Moderate confidence in this trade direction."
+    else:
+        return "Undefined state - this should not occur."
 
 # Manual logging endpoint
 @app.post("/log")
@@ -235,11 +300,12 @@ def manual_log(log: LogRequest):
         '''INSERT INTO trades (
             timestamp, asset, asset_type, strategy,
             entry_price, stop_loss, take_profit, confidence,
-            result, pnl, notes, indicators
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+            result, pnl, notes, indicators, position_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
         ts, log.asset, log.asset_type, log.strategy,
         log.entry_price, log.stop_loss, log.take_profit, log.confidence,
-        log.result, log.pnl, log.notes or "", str(indicators_data)
+        log.result, log.pnl, log.notes or "", str(indicators_data),
+        log.position_type
     ))
     db.commit()
     db.close()
@@ -274,8 +340,18 @@ def learn():
     correct_conf = sum(1 for r in rows if r["confidence"] and r["pnl"] is not None and 
                     ((r["confidence"]>=0.5 and r["pnl"]>0) or (r["confidence"]<0.5 and r["pnl"]<=0)))
     accuracy = correct_conf / total if total else None
+    
+    # Position type analysis
+    long_trades = sum(1 for r in rows if getattr(r, "position_type", "LONG") == "LONG")
+    short_trades = sum(1 for r in rows if getattr(r, "position_type", "LONG") == "SHORT")
+    
+    long_wins = sum(1 for r in rows if getattr(r, "position_type", "LONG") == "LONG" and r["pnl"] and r["pnl"] > 0)
+    short_wins = sum(1 for r in rows if getattr(r, "position_type", "LONG") == "SHORT" and r["pnl"] and r["pnl"] > 0)
+    
+    long_win_rate = long_wins / long_trades if long_trades else None
+    short_win_rate = short_wins / short_trades if short_trades else None
 
-    # Return with news analysis
+    # Return with news analysis and position type analysis
     return {
         "total_trades": total,
         "wins": wins,
@@ -288,6 +364,13 @@ def learn():
             "news_influenced_trades": news_trades_count,
             "news_win_rate": news_win_rate,
             "difference_from_overall": (news_win_rate - win_rate) if news_win_rate and win_rate else None
+        },
+        "position_analysis": {
+            "long_trades": long_trades,
+            "short_trades": short_trades,  
+            "long_win_rate": long_win_rate,
+            "short_win_rate": short_win_rate,
+            "long_vs_short_win_rate_difference": (long_win_rate - short_win_rate) if long_win_rate and short_win_rate else None
         }
     }
 
@@ -328,4 +411,4 @@ def update_strategy_settings(settings: UpdateStrategySettings):
 # Health check
 @app.get("/")
 def root():
-    return {"message": "AI strategy backend v7 with news integration is running."}
+    return {"message": "AI strategy backend v8 with bidirectional trading and confidence-based filtering."}
